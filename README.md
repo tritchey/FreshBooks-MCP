@@ -12,7 +12,9 @@ entries — with a human review step before anything is pushed.
 - **`skills/hours-report/`** — Claude Code skill (with `scripts/session_hours.py`) that
   reconstructs attended time per day and per project from `~/.claude/projects/*/*.jsonl`,
   separating it from session wall-clock and rounding to billable increments. Usable on
-  its own; `freshbooks-timesheet` depends on it.
+  its own; `freshbooks-timesheet` depends on it. This repo is where it is maintained; the
+  ATeam-MCP plugin carries a byte-identical copy, because Claude Code plugins have no
+  dependency mechanism and a skill that invokes another skill's script must bundle it.
 - **`skills/freshbooks-timesheet/`** — Claude Code skill that orchestrates:
   hours-report → label→project mapping → proposed-entries table → approval → `log_time`.
 - **`~/.freshbooks-mcp/`** — local state: OAuth tokens, label→project mapping, and a
@@ -42,33 +44,59 @@ Create `~/.freshbooks-mcp/credentials.json` (mode 0600):
 server registration. `redirect_uri` defaults to `https://localhost:8414/callback`; add
 it to the JSON only if your app registered something else.)
 
-### 3. Register the server with Claude Code
+### 3. Install the plugin
+
+The MCP server and both skills ship as one Claude Code plugin. This repo is its own
+marketplace, so a clone is all anyone needs:
 
 ```bash
-claude mcp add --scope user freshbooks \
-  -- uv run --directory /Users/tritchey/Projects/RedRomeLogic/FreshBooks-MCP freshbooks-mcp
+git clone git@github.com:tritchey/FreshBooks-MCP.git
+claude plugin marketplace add ./FreshBooks-MCP
+claude plugin install freshbooks
 ```
 
-### 4. Install the skills
+The repo is private, so this stays between people who already have access to it; nothing
+is published anywhere public. Restart Claude Code afterwards to pick up the server.
 
-Symlink both skill directories into `~/.claude/skills/` so edits in the repo are picked
-up immediately. `freshbooks-timesheet` invokes `hours-report` at
-`~/.claude/skills/hours-report/`, so both must be installed. From the repo root:
+Requires [`uv`](https://docs.astral.sh/uv/) on `PATH` — the server is launched with
+`uv run --directory ${CLAUDE_PLUGIN_ROOT}`, which resolves wherever the plugin landed.
+Step 2's credentials live in `~/.freshbooks-mcp/`, outside the plugin, so they survive
+installs and updates.
 
-```bash
-mkdir -p ~/.claude/skills
-for s in hours-report freshbooks-timesheet; do
-  ln -s "$(pwd)/skills/$s" ~/.claude/skills/$s
-done
-```
+> **Upgrading from the symlink setup?** Remove the old wiring first, or you get duplicate
+> skills and two `freshbooks` servers:
+>
+> ```bash
+> claude mcp remove --scope user freshbooks
+> rm ~/.claude/skills/freshbooks-timesheet ~/.claude/skills/hours-report
+> ```
+>
+> Removing the `hours-report` symlink is safe once the ATeam-MCP plugin is installed too —
+> it carries its own copy, and nothing references the `~/.claude/skills/` path any more.
 
-### 5. Authenticate (one time, and again only if tokens are lost)
+### 4. Authenticate (one time, and again only if tokens are lost)
 
 In a Claude Code session: ask Claude to connect to FreshBooks. It calls `get_auth_url`;
 open the URL, approve, and the browser lands on the (non-loading) redirect page — copy
 the `code=` value from the address bar and give it to Claude, which calls
 `submit_auth_code`. `whoami` confirms the connection. Tokens auto-refresh from then on;
 refresh tokens are single-use, so the server persists each new pair atomically.
+
+### 5. Working on the plugin itself
+
+Plugin installs are copies, so edits in the repo will not show up in an installed plugin.
+For development, skip the install and symlink instead:
+
+```bash
+mkdir -p ~/.claude/skills
+for s in hours-report freshbooks-timesheet; do
+  ln -s "$(pwd)/skills/$s" ~/.claude/skills/$s
+done
+claude mcp add --scope user freshbooks -- uv run --directory "$(pwd)" freshbooks-mcp
+```
+
+Note that `${CLAUDE_PLUGIN_ROOT}` is unset under this arrangement; both skills say what to
+use instead. Validate manifest changes with `claude plugin validate . --strict`.
 
 ## Use
 
@@ -101,4 +129,16 @@ create/update/no-change), and pushes only after approval.
 ```bash
 uv sync
 uv run pytest
+claude plugin validate . --strict     # both manifests
 ```
+
+### hours-report is copied into ATeam-MCP
+
+`skills/hours-report/` is maintained here and vendored into the ATeam-MCP plugin. The two
+are byte-identical, so drift shows up as any output at all from:
+
+```bash
+diff -r skills/hours-report ../ATeam-MCP/skills/hours-report
+```
+
+After changing it here, copy it over and commit in both repos.

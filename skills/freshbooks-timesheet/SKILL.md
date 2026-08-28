@@ -1,6 +1,6 @@
 ---
 name: freshbooks-timesheet
-description: Push billable hours computed from Claude Code sessions into FreshBooks time entries. Use when asked to "update my timesheet", "log my hours in FreshBooks", "push time to FreshBooks", "sync my timesheets", or to bill tracked hours for a client or date range. Requires the freshbooks MCP server and the hours-report skill.
+description: Push billable hours computed from Claude Code sessions into FreshBooks time entries. Use when asked to "update my timesheet", "log my hours in FreshBooks", "push time to FreshBooks", "sync my timesheets", or to bill tracked hours for a client or date range. Requires the freshbooks MCP server; the hours-report skill ships alongside it.
 ---
 
 # FreshBooks timesheet sync
@@ -12,13 +12,19 @@ number here becomes a billing dispute later.
 
 ## 1. Compute the hours
 
-Follow the **hours-report** skill (`~/.claude/skills/hours-report/`) to scope the request
-and run its script — same date-range and project-selection rules, but with `--json`:
+Follow the **hours-report** skill to scope the request and run its script — same
+date-range and project-selection rules, but with `--json`. It ships inside this plugin,
+so it is always present; `${CLAUDE_PLUGIN_ROOT}` resolves to wherever the plugin was
+installed and is the only correct way to reach it.
 
 ```bash
-python3 ~/.claude/skills/hours-report/scripts/session_hours.py \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/hours-report/scripts/session_hours.py" \
   --since 2026-08-18 --label myclient=-SomeProject --json
 ```
+
+If `CLAUDE_PLUGIN_ROOT` is unset, this skill is running from a checkout rather than an
+installed plugin; use `skills/hours-report/scripts/session_hours.py` relative to the repo
+root instead.
 
 Use each day's `billable_min` (already rounded per that skill's method) as the minutes to
 log. Keep `attention_mid_min` and `wall_min` on hand for the review table so the person

@@ -27,7 +27,7 @@ guess would change the output materially.
 ## 2. Run the script
 
 ```bash
-python3 ~/.claude/skills/hours-report/scripts/session_hours.py \
+python3 "${CLAUDE_PLUGIN_ROOT}/skills/hours-report/scripts/session_hours.py" \
   --since 2026-08-11 \
   --label ios=-Acme-widgets-ios \
   --label android=-Acme-widgets-android \
