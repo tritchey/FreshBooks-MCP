@@ -18,8 +18,8 @@ guess would change the output materially.
 - **Date range.** "Since August 11" → `--since 2026-08-11`. Watch the year: transcript
   timestamps are UTC ISO-8601, the script converts to local time.
 - **Which projects.** List `~/.claude/projects/` first. One logical project often spans
-  several directories — a parent repo plus per-platform subdirectories (`…-Avanti`,
-  `…-Avanti-tourcaddie-ios`, `…-Avanti-tourcaddie-android`). Include all of them and
+  several directories — a parent repo plus per-platform subdirectories (`…-Acme`,
+  `…-Acme-widgets-ios`, `…-Acme-widgets-android`). Include all of them and
   break them out as separate columns; the split is usually the interesting part.
 - **Whether commits matter.** If the directories map to git repos, pass `--repo`.
   Commits per attended hour is the most legible productivity figure in the report.
@@ -29,10 +29,10 @@ guess would change the output materially.
 ```bash
 python3 ~/.claude/skills/hours-report/scripts/session_hours.py \
   --since 2026-08-11 \
-  --label ios=-Avanti-tourcaddie-ios \
-  --label android=-Avanti-tourcaddie-android \
-  --label planning='-RedRomeLogic-Avanti$' \
-  --repo ios=~/Projects/RedRomeLogic/Avanti/tourcaddie-ios
+  --label ios=-Acme-widgets-ios \
+  --label android=-Acme-widgets-android \
+  --label planning='-Clients-Acme$' \
+  --repo ios=~/Projects/Clients/Acme/widgets-ios
 ```
 
 - `--match SUBSTR` grabs every matching directory and auto-names it; `--label NAME=SUBSTR`

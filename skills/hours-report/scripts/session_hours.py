@@ -9,11 +9,11 @@ Reads ~/.claude/projects/*/*.jsonl and reports, per day and per project:
   commits     optional, from --repo
 
 Usage
-  session_hours.py --since 2026-08-11 --match tourcaddie
-  session_hours.py --since 2026-08-01 --until 2026-08-15 --match kalogon --json
+  session_hours.py --since 2026-08-11 --match widgets
+  session_hours.py --since 2026-08-01 --until 2026-08-15 --match acme --json
   session_hours.py --since 2026-08-11 \
-      --label ios=-tourcaddie-ios --label android=-tourcaddie-android \
-      --repo ios=~/Projects/Foo/tourcaddie-ios
+      --label ios=-widgets-ios --label android=-widgets-android \
+      --repo ios=~/Projects/Acme/widgets-ios
 
 See references/method.md in this skill for what the numbers mean.
 """
