@@ -1,13 +1,18 @@
 # FreshBooks MCP
 
-An MCP server that connects Claude Code to a FreshBooks account, plus a companion skill
-that turns hours computed from Claude Code session transcripts (via the `hours-report`
-skill) into FreshBooks time entries — with a human review step before anything is pushed.
+An MCP server that connects Claude Code to a FreshBooks account, plus two companion
+skills: `hours-report`, which estimates attended hours from Claude Code session
+transcripts, and `freshbooks-timesheet`, which turns those hours into FreshBooks time
+entries — with a human review step before anything is pushed.
 
 ## Pieces
 
 - **`src/freshbooks_mcp/`** — Python MCP server (FastMCP, stdio). OAuth2 against the
   FreshBooks API; tools for projects, clients, and idempotent time-entry upserts.
+- **`skills/hours-report/`** — Claude Code skill (with `scripts/session_hours.py`) that
+  reconstructs attended time per day and per project from `~/.claude/projects/*/*.jsonl`,
+  separating it from session wall-clock and rounding to billable increments. Usable on
+  its own; `freshbooks-timesheet` depends on it.
 - **`skills/freshbooks-timesheet/`** — Claude Code skill that orchestrates:
   hours-report → label→project mapping → proposed-entries table → approval → `log_time`.
 - **`~/.freshbooks-mcp/`** — local state: OAuth tokens, label→project mapping, and a
@@ -44,11 +49,17 @@ claude mcp add --scope user freshbooks \
   -- uv run --directory /Users/tritchey/Projects/RedRomeLogic/FreshBooks-MCP freshbooks-mcp
 ```
 
-### 4. Install the skill
+### 4. Install the skills
+
+Symlink both skill directories into `~/.claude/skills/` so edits in the repo are picked
+up immediately. `freshbooks-timesheet` invokes `hours-report` at
+`~/.claude/skills/hours-report/`, so both must be installed. From the repo root:
 
 ```bash
-ln -s /Users/tritchey/Projects/RedRomeLogic/FreshBooks-MCP/skills/freshbooks-timesheet \
-      ~/.claude/skills/freshbooks-timesheet
+mkdir -p ~/.claude/skills
+for s in hours-report freshbooks-timesheet; do
+  ln -s "$(pwd)/skills/$s" ~/.claude/skills/$s
+done
 ```
 
 ### 5. Authenticate (one time, and again only if tokens are lost)
