@@ -1,7 +1,7 @@
 [project]
 name = "freshbooks-mcp"
-version = "0.1.0"
-description = "MCP server for logging and reconciling time entries in FreshBooks."
+version = "0.2.0"
+description = "MCP server for logging and reconciling time entries and expenses in FreshBooks."
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]",

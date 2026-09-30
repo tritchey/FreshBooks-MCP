@@ -1,13 +1,13 @@
 {
   "name": "redromelogic-freshbooks",
-  "description": "Red Rome Logic FreshBooks time-tracking plugin.",
+  "description": "Red Rome Logic FreshBooks time-tracking and expenses plugin.",
   "owner": {
     "name": "Tim Ritchey"
   },
   "plugins": [
     {
       "name": "freshbooks",
-      "description": "MCP server and skills for logging and reconciling time entries in FreshBooks.",
+      "description": "MCP server and skills for logging and reconciling time entries and expenses in FreshBooks.",
       "author": {
         "name": "Tim Ritchey"
       },

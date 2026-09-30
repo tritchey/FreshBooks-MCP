@@ -1,9 +1,11 @@
-"""FastMCP server exposing FreshBooks auth, lookups, and idempotent time logging."""
+"""FastMCP server exposing FreshBooks auth, lookups, and idempotent time and
+expense logging."""
 
 from __future__ import annotations
 
 import functools
 from datetime import date, datetime, timedelta, timezone
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any, Callable
 
 from mcp.server.mcpserver import MCPServer
@@ -17,6 +19,12 @@ mcp = MCPServer("freshbooks", version=__version__)
 # Logged time has to land somewhere on the day; 09:00 local is a neutral choice
 # that keeps entries on the intended calendar date in every timezone.
 WORKDAY_START_HOUR = 9
+
+# Expenses belong to a staff member. The account owner is always staff 1, which
+# is what we fall back to when the identity carries no role for the account.
+DEFAULT_STAFF_ID = 1
+
+EXPENSE_STATUS = {0: "internal", 1: "outstanding", 2: "invoiced", 4: "recouped"}
 
 
 # --------------------------------------------------------------------------
@@ -54,6 +62,36 @@ def _require_connection() -> dict[str, Any]:
             "No FreshBooks business selected. Re-run submit_auth_code to store the business id."
         )
     return tokens
+
+
+def _require_account(tokens: dict[str, Any]) -> str:
+    account_id = tokens.get("account_id")
+    if not account_id:
+        raise RuntimeError("No FreshBooks account_id stored. Re-run submit_auth_code.")
+    return str(account_id)
+
+
+def _staff_id_from_identity(identity: dict[str, Any], account_id: Any) -> int | None:
+    """The Accounting service's staff id is the identity's `userid` on the account."""
+    for role in identity.get("roles") or []:
+        if str(role.get("accountid")) == str(account_id) and role.get("userid") is not None:
+            return int(role["userid"])
+    return None
+
+
+def _resolve_staff_id(client: FreshBooksClient, tokens: dict[str, Any], account_id: str) -> int:
+    """Staff id for new expenses: cached in tokens.json, else derived from the
+    identity (and cached), else the account owner."""
+    if tokens.get("staff_id") is not None:
+        return int(tokens["staff_id"])
+    staff_id = _staff_id_from_identity(client.get_identity(), account_id)
+    if staff_id is None:
+        return DEFAULT_STAFF_ID
+    # Re-read before writing: the call above may have rotated the token pair.
+    latest = store.load_tokens()
+    latest["staff_id"] = staff_id
+    store.save_tokens(latest)
+    return staff_id
 
 
 def _utc_iso(moment: datetime) -> str:
@@ -97,6 +135,81 @@ def _project_summary(project: dict[str, Any]) -> dict[str, Any]:
         "active": project.get("active"),
         "complete": project.get("complete"),
     }
+
+
+def _category_id(category: dict[str, Any]) -> int | None:
+    value = category.get("id", category.get("categoryid"))
+    return int(value) if value is not None else None
+
+
+def _active_categories(categories: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [c for c in categories if not c.get("vis_state") and _category_id(c) is not None]
+
+
+PATH_SEPARATOR = " > "
+
+
+def _category_paths(categories: list[dict[str, Any]]) -> dict[int, str]:
+    """{category_id: "Grandparent > Parent > Name"}. FreshBooks accounts carry
+    several categories with the same bare name (a standard tree, a deprecated
+    cost-of-goods-sold copy of it, and custom ones under "Other Expenses"), so
+    the path is what tells them apart."""
+    by_id = {_category_id(c): c for c in categories if _category_id(c) is not None}
+    paths: dict[int, str] = {}
+    for category_id, category in by_id.items():
+        parts = [str(category.get("category") or "")]
+        seen = {category_id}
+        parent_id = category.get("parentid")
+        while parent_id and int(parent_id) in by_id and int(parent_id) not in seen:
+            seen.add(int(parent_id))
+            parent = by_id[int(parent_id)]
+            parts.append(str(parent.get("category") or ""))
+            parent_id = parent.get("parentid")
+        paths[category_id] = PATH_SEPARATOR.join(reversed(parts))  # type: ignore[index]
+    return paths
+
+
+def _normalize_path(text: str) -> str:
+    return PATH_SEPARATOR.join(part.strip() for part in text.split(">")).lower()
+
+
+def _format_amount(value: Any) -> str:
+    """Positive decimal with two places, as the Accounting service's string-decimal."""
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise RuntimeError(f"Expense amount {value!r} is not a number.") from None
+    if not amount.is_finite() or amount <= 0:
+        raise RuntimeError(f"Expense amount must be positive, got {value!r}.")
+    return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _expense_summary(
+    expense: dict[str, Any], category_paths: dict[int, str], refs: dict[int, str]
+) -> dict[str, Any]:
+    amount = expense.get("amount") or {}
+    expense_id = expense.get("id")
+    category_id = expense.get("categoryid")
+    status = expense.get("status")
+    owned = expense_id is not None and int(expense_id) in refs
+    summary: dict[str, Any] = {
+        "id": expense_id,
+        "date": expense.get("date"),
+        "amount": amount.get("amount"),
+        "currency": amount.get("code"),
+        "vendor": expense.get("vendor"),
+        "notes": expense.get("notes"),
+        "category_id": category_id,
+        "category": category_paths.get(int(category_id)) if category_id is not None else None,
+        "client_id": expense.get("clientid") or None,
+        "project_id": expense.get("projectid") or None,
+        "status": EXPENSE_STATUS.get(status, status),
+        "has_receipt": expense.get("has_receipt"),
+        "owned_by_ledger": owned,
+    }
+    if owned:
+        summary["ref"] = refs[int(expense_id)]
+    return summary
 
 
 # --------------------------------------------------------------------------
@@ -157,6 +270,9 @@ def submit_auth_code(code: str) -> dict[str, Any]:
     if businesses:
         tokens["business_id"] = businesses[0]["business_id"]
         tokens["account_id"] = businesses[0]["account_id"]
+        staff_id = _staff_id_from_identity(identity, businesses[0]["account_id"])
+        if staff_id is not None:
+            tokens["staff_id"] = staff_id
     store.save_tokens(tokens)
 
     name = " ".join(
@@ -205,6 +321,7 @@ def whoami() -> dict[str, Any]:
         "identity_id": identity.get("id"),
         "business_id": tokens.get("business_id"),
         "account_id": tokens.get("account_id"),
+        "staff_id": tokens.get("staff_id"),
         "token_expires_at": tokens.get("expires_at"),
     }
 
@@ -234,12 +351,10 @@ def list_clients() -> dict[str, Any]:
     organization, name and email.
     """
     tokens = _require_connection()
-    account_id = tokens.get("account_id")
-    if not account_id:
-        raise RuntimeError("No FreshBooks account_id stored. Re-run submit_auth_code.")
+    account_id = _require_account(tokens)
 
     with _make_client() as client:
-        clients = client.list_clients(str(account_id))
+        clients = client.list_clients(account_id)
 
     return {
         "clients": [
@@ -537,6 +652,321 @@ def delete_time_entry(time_entry_id: int) -> dict[str, Any]:
         client.delete_time_entry(int(tokens["business_id"]), int(time_entry_id))
     store.drop_ledger_entry_id(int(time_entry_id))
     return {"deleted": True, "time_entry_id": int(time_entry_id)}
+
+
+# --------------------------------------------------------------------------
+# expense tools
+# --------------------------------------------------------------------------
+
+
+@mcp.tool()
+@_handle_errors
+def list_expense_categories() -> dict[str, Any]:
+    """List the FreshBooks expense categories for the connected account, as
+    category_id, name, path ("Parent > Name"), parent_id and is_cogs (a
+    deprecated cost-of-goods-sold duplicate of a regular category). Accounts
+    usually hold several categories with the same bare name; log_expenses
+    accepts a name when it is unambiguous (regular categories win over
+    is_cogs ones), otherwise the full path or the category_id.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    with _make_client() as client:
+        categories = _active_categories(client.list_expense_categories(account_id))
+
+    paths = _category_paths(categories)
+    return {
+        "categories": sorted(
+            (
+                {
+                    "category_id": _category_id(category),
+                    "name": category.get("category"),
+                    "path": paths[_category_id(category)],  # type: ignore[index]
+                    "parent_id": category.get("parentid") or None,
+                    "is_cogs": bool(category.get("is_cogs")),
+                }
+                for category in categories
+            ),
+            key=lambda item: (item["path"].lower(), item["is_cogs"]),
+        )
+    }
+
+
+@mcp.tool()
+@_handle_errors
+def list_expenses(date_from: str, date_to: str) -> dict[str, Any]:
+    """List expenses dated between two dates, inclusive (YYYY-MM-DD). Each
+    expense reports id, date, amount, currency, vendor, notes, category_id,
+    category (as a "Parent > Name" path), client_id, project_id, status
+    (internal | outstanding | invoiced | recouped), has_receipt and owned_by_ledger - true when this server created
+    the expense (its ref is included too) and may therefore update or delete it.
+    Expenses with owned_by_ledger=false were entered by hand and are never
+    modified. Expenses deleted in FreshBooks are omitted.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    date.fromisoformat(date_from)
+    date.fromisoformat(date_to)
+
+    with _make_client() as client:
+        expenses = client.list_expenses(account_id, date_from=date_from, date_to=date_to)
+        categories = client.list_expense_categories(account_id)
+
+    paths = _category_paths(categories)
+    refs = store.expense_ledger_refs()
+    return {
+        "expenses": [
+            _expense_summary(expense, paths, refs)
+            for expense in expenses
+            if not expense.get("vis_state")
+        ]
+    }
+
+
+def _resolve_category(entry: dict[str, Any], categories: list[dict[str, Any]]) -> int:
+    """Resolve an input entry's category_id or category name to a category id."""
+    if entry.get("category_id") is not None:
+        category_id = int(entry["category_id"])
+        if not any(_category_id(c) == category_id for c in categories):
+            raise RuntimeError(
+                f"No expense category with id {category_id}. "
+                "Call list_expense_categories to see the available ids."
+            )
+        return category_id
+
+    name = str(entry.get("category") or "").strip()
+    if not name:
+        raise RuntimeError("Entry needs either a 'category' name or a numeric 'category_id'.")
+
+    paths = _category_paths(categories)
+    wanted = _normalize_path(name)
+    matches = [
+        c
+        for c in categories
+        if str(c.get("category") or "").strip().lower() == wanted
+        or paths[_category_id(c)].lower() == wanted  # type: ignore[index]
+    ]
+    if not matches:
+        known = ", ".join(sorted({str(c.get("category")) for c in categories})) or "(none)"
+        raise RuntimeError(f"Unknown expense category {name!r}. Known categories: {known}.")
+    if len(matches) > 1:
+        # The cost-of-goods-sold tree duplicates the regular one name for name
+        # and is deprecated; only pick it when it is the sole match.
+        regular = [c for c in matches if not c.get("is_cogs")]
+        if len(regular) == 1:
+            matches = regular
+    if len(matches) > 1:
+        options = "; ".join(
+            f"{paths[_category_id(c)]!r} (id {_category_id(c)}"  # type: ignore[index]
+            + (", cost of goods sold)" if c.get("is_cogs") else ")")
+            for c in matches
+        )
+        raise RuntimeError(
+            f"Expense category {name!r} is ambiguous: {options}. "
+            "Pass the full path (for example 'Other Expenses > Travel') or the category_id."
+        )
+    return int(_category_id(matches[0]))  # type: ignore[arg-type]
+
+
+def _expense_matches(current: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """True when the expense FreshBooks holds already equals what we would write."""
+    current_amount = current.get("amount") or {}
+    try:
+        if Decimal(str(current_amount.get("amount"))) != Decimal(payload["amount"]["amount"]):
+            return False
+        if "markup_percent" in payload and Decimal(
+            str(current.get("markup_percent") or 0)
+        ) != Decimal(payload["markup_percent"]):
+            return False
+    except InvalidOperation:
+        return False
+
+    wanted_code = payload["amount"].get("code")
+    if wanted_code and str(current_amount.get("code") or "").upper() != wanted_code:
+        return False
+
+    return (
+        int(current.get("categoryid") or 0) == payload["categoryid"]
+        and str(current.get("date") or "") == payload["date"]
+        and (current.get("vendor") or "") == payload["vendor"]
+        and (current.get("notes") or "") == payload["notes"]
+        and int(current.get("clientid") or 0) == payload["clientid"]
+        and int(current.get("projectid") or 0) == payload["projectid"]
+    )
+
+
+@mcp.tool()
+@_handle_errors
+def log_expenses(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Log expenses to FreshBooks idempotently. Each entry is a dict with:
+    date ("YYYY-MM-DD"), amount (number; two decimals are kept), and either
+    category (a name or "Parent > Name" path from list_expense_categories,
+    case-insensitive; the path is needed when the bare name is ambiguous) or
+    category_id (int). Optional: vendor, notes, currency (3-letter code, else
+    the business currency), markup_percent, and - to bill the expense to a
+    client - either label / project_id (as in log_time; the project's client is
+    used) or a bare client_id. Without a client the expense is internal.
+
+    ref (optional) is a short stable identifier of your choosing, such as a
+    receipt number or "2026-09-01-uber". Re-running with the same ref updates
+    the expense this server previously created; if nothing changed it is
+    reported as "unchanged" and no write is made. When ref is omitted it is
+    derived from date, vendor and amount, so an identical re-run is still a
+    no-op but a changed amount creates a new expense - pass a ref whenever you
+    may need to correct an expense later. Expenses created outside this server
+    are never modified or deleted.
+
+    Returns per-entry results with action created | updated | unchanged | failed
+    (failures are per entry; the rest of the batch still runs) plus a summary.
+    """
+    tokens = _require_connection()
+    business_id = int(tokens["business_id"])
+    account_id = _require_account(tokens)
+    mapping = store.load_mapping()
+
+    results: list[dict[str, Any]] = []
+    summary = {"created": 0, "updated": 0, "unchanged": 0, "failed": 0}
+
+    with _make_client() as client:
+        project_cache: dict[int, dict[str, Any]] | None = None
+        category_cache: list[dict[str, Any]] | None = None
+        staff_cache: int | None = None
+
+        def lookup_project(project_id: int) -> dict[str, Any] | None:
+            nonlocal project_cache
+            if project_cache is None:
+                project_cache = {
+                    int(p["id"]): p
+                    for p in client.list_projects(business_id, active_only=False)
+                    if p.get("id") is not None
+                }
+            return project_cache.get(project_id)
+
+        def categories() -> list[dict[str, Any]]:
+            nonlocal category_cache
+            if category_cache is None:
+                category_cache = _active_categories(client.list_expense_categories(account_id))
+            return category_cache
+
+        def staff_id() -> int:
+            nonlocal staff_cache
+            if staff_cache is None:
+                staff_cache = _resolve_staff_id(client, tokens, account_id)
+            return staff_cache
+
+        for raw in entries:
+            try:
+                result = _log_one_expense(
+                    client, account_id, mapping, lookup_project, categories, staff_id, raw
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad entry must not sink the batch
+                result = {
+                    "ref": raw.get("ref"),
+                    "date": raw.get("date"),
+                    "amount": raw.get("amount"),
+                    "action": "failed",
+                    "error": str(exc) or exc.__class__.__name__,
+                }
+            summary[result["action"]] += 1
+            results.append(result)
+
+    return {"results": results, "summary": summary}
+
+
+def _log_one_expense(
+    client: FreshBooksClient,
+    account_id: str,
+    mapping: dict[str, Any],
+    lookup_project: Callable[[int], dict[str, Any] | None],
+    categories: Callable[[], list[dict[str, Any]]],
+    staff_id: Callable[[], int],
+    raw: dict[str, Any],
+) -> dict[str, Any]:
+    day = str(raw.get("date") or "")
+    if not day:
+        raise RuntimeError("Entry is missing 'date' (YYYY-MM-DD).")
+    date.fromisoformat(day)  # validate the format up front
+
+    if raw.get("amount") is None:
+        raise RuntimeError("Entry is missing 'amount'.")
+    amount = _format_amount(raw["amount"])
+    currency = str(raw["currency"]).strip().upper() if raw.get("currency") else None
+    vendor = str(raw.get("vendor") or "")
+    notes = str(raw.get("notes") or "")
+    category_id = _resolve_category(raw, categories())
+
+    project_id, client_id = 0, 0
+    if raw.get("label") or raw.get("project_id") is not None:
+        project_id, project_client = _resolve_target(raw, mapping, lookup_project)
+        client_id = int(project_client or raw.get("client_id") or 0)
+    elif raw.get("client_id") is not None:
+        client_id = int(raw["client_id"])
+
+    ref = str(raw.get("ref") or "").strip() or f"{day}|{vendor}|{amount}"
+
+    payload: dict[str, Any] = {
+        "amount": {"amount": amount, **({"code": currency} if currency else {})},
+        "categoryid": category_id,
+        "date": day,
+        "vendor": vendor,
+        "notes": notes,
+        "clientid": client_id,
+        "projectid": project_id,
+    }
+    if raw.get("markup_percent") is not None:
+        payload["markup_percent"] = str(raw["markup_percent"])
+
+    def outcome(action: str, expense_id: int) -> dict[str, Any]:
+        return {
+            "ref": ref,
+            "date": day,
+            "amount": amount,
+            "action": action,
+            "expense_id": expense_id,
+        }
+
+    existing_id = store.load_expense_ledger().get(ref)
+    if existing_id is not None:
+        current = client.get_expense(account_id, int(existing_id))
+        if current is None or current.get("vis_state") == 1:
+            # Deleted in FreshBooks since we wrote it; forget it and start over.
+            store.drop_expense_ledger_key(ref)
+            existing_id = None
+        elif _expense_matches(current, payload):
+            return outcome("unchanged", int(existing_id))
+        else:
+            client.update_expense(account_id, int(existing_id), payload)
+            return outcome("updated", int(existing_id))
+
+    owner = int(raw["staff_id"]) if raw.get("staff_id") is not None else staff_id()
+    created = client.create_expense(account_id, {**payload, "staffid": owner})
+    new_id = created.get("id")
+    if new_id is None:
+        raise RuntimeError(f"FreshBooks did not return an id for the created expense: {created}")
+    store.set_expense_ledger_entry(ref, int(new_id))
+    return outcome("created", int(new_id))
+
+
+@mcp.tool()
+@_handle_errors
+def delete_expense(expense_id: int) -> dict[str, Any]:
+    """Delete an expense that this server created. Refuses any id that is not in
+    the local expense ledger, so hand-entered FreshBooks expenses can never be
+    deleted through this tool. Use list_expenses to see which expenses are
+    owned_by_ledger.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    if int(expense_id) not in store.expense_ledger_ids():
+        raise RuntimeError(
+            f"Refusing to delete expense {expense_id}: it was not created by this "
+            "server (not in the local ledger). Delete it in FreshBooks if that is intended."
+        )
+
+    with _make_client() as client:
+        client.delete_expense(account_id, int(expense_id))
+    store.drop_expense_ledger_id(int(expense_id))
+    return {"deleted": True, "expense_id": int(expense_id)}
 
 
 def main() -> None:

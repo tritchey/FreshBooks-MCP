@@ -1,7 +1,7 @@
 {
   "name": "freshbooks",
-  "description": "MCP server and skills for logging and reconciling time entries in FreshBooks, including the hours-report skill it computes hours with.",
-  "version": "0.1.0",
+  "description": "MCP server and skills for logging and reconciling time entries and expenses in FreshBooks, including the hours-report skill it computes hours with.",
+  "version": "0.2.0",
   "author": {
     "name": "Tim Ritchey"
   },

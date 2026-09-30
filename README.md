@@ -1,14 +1,15 @@
 # FreshBooks MCP
 
-An MCP server that connects Claude Code to a FreshBooks account, plus two companion
-skills: `hours-report`, which estimates attended hours from Claude Code session
+An MCP server that connects Claude Code to a FreshBooks account for time entries and
+expenses, plus two companion skills: `hours-report`, which estimates attended hours from Claude Code session
 transcripts, and `freshbooks-timesheet`, which turns those hours into FreshBooks time
 entries — with a human review step before anything is pushed.
 
 ## Pieces
 
 - **`src/freshbooks_mcp/`** — Python MCP server (FastMCP, stdio). OAuth2 against the
-  FreshBooks API; tools for projects, clients, and idempotent time-entry upserts.
+  FreshBooks API; tools for projects, clients, expense categories, and idempotent
+  time-entry and expense upserts.
 - **`skills/hours-report/`** — Claude Code skill (with `scripts/session_hours.py`) that
   reconstructs attended time per day and per project from `~/.claude/projects/*/*.jsonl`,
   separating it from session wall-clock and rounding to billable increments. Usable on
@@ -17,9 +18,9 @@ entries — with a human review step before anything is pushed.
   dependency mechanism and a skill that invokes another skill's script must bundle it.
 - **`skills/freshbooks-timesheet/`** — Claude Code skill that orchestrates:
   hours-report → label→project mapping → proposed-entries table → approval → `log_time`.
-- **`~/.freshbooks-mcp/`** — local state: OAuth tokens, label→project mapping, and a
-  ledger of time-entry ids this tool created (so re-syncs update instead of duplicate,
-  and hand-entered time is never touched).
+- **`~/.freshbooks-mcp/`** — local state: OAuth tokens, label→project mapping, and
+  ledgers of the time-entry and expense ids this tool created (so re-syncs update
+  instead of duplicate, and hand-entered records are never touched).
 
 ## Setup
 
@@ -27,7 +28,8 @@ entries — with a human review step before anything is pushed.
 
 1. Go to <https://my.freshbooks.com/#/developer> and create an application.
 2. Scopes: `user:profile:read`, `user:clients:read`, `user:projects:read`,
-   `user:time_entries:read`, `user:time_entries:write`.
+   `user:time_entries:read`, `user:time_entries:write`, `user:expenses:read`,
+   `user:expenses:write`.
 3. Redirect URI: `https://localhost:8414/callback` (it never needs to serve anything —
    FreshBooks requires an HTTPS URI, and the auth flow copies the code from the address bar).
 4. Note the **Client ID** and **Client Secret**.
@@ -82,6 +84,11 @@ the `code=` value from the address bar and give it to Claude, which calls
 `submit_auth_code`. `whoami` confirms the connection. Tokens auto-refresh from then on;
 refresh tokens are single-use, so the server persists each new pair atomically.
 
+Scopes are bound to the app, and a token only carries the scopes the app had when it was
+issued. After adding scopes to an existing app (the expenses scopes, say), repeat this
+step so a new token is issued with them; until then the expense tools fail with an
+`insufficient_scope` error that says which scope is missing.
+
 ### 5. Working on the plugin itself
 
 Plugin installs are copies, so edits in the repo will not show up in an installed plugin.
@@ -106,6 +113,12 @@ Claude runs the hours-report skill, maps project labels to FreshBooks projects (
 once per new label), shows the proposed entries (day × project × hours × note, marked
 create/update/no-change), and pushes only after approval.
 
+> "Log a $45 Uber to the airport on Sep 1 as a travel expense billed to Acme."
+
+Claude picks the category from `list_expense_categories`, resolves the client through the
+same label→project mapping, and calls `log_expenses` with a `ref` so a later correction
+updates that expense instead of creating a second one.
+
 ## Tools
 
 | Tool | Purpose |
@@ -117,10 +130,15 @@ create/update/no-change), and pushes only after approval.
 | `list_time_entries` | What's logged in a range, flagged if created by this tool |
 | `log_time` | Idempotent upsert of per-day entries (create/update/unchanged per entry) |
 | `delete_time_entry` | Delete — refuses entries this tool didn't create |
+| `list_expense_categories` | Expense categories with their `Parent > Name` paths, for picking one by name, path or id |
+| `list_expenses` | Expenses in a date range, flagged if created by this tool |
+| `log_expenses` | Idempotent upsert of expenses keyed by `ref` (create/update/unchanged per entry) |
+| `delete_expense` | Soft-delete — refuses expenses this tool didn't create |
 
 ## Safety properties
 
-- Entries not created by this tool (not in the ledger) are never updated or deleted.
+- Time entries and expenses not created by this tool (not in a ledger) are never updated
+  or deleted.
 - Re-running a sync for an overlapping range updates in place; no duplicates.
 - Token/state files live outside the repo with 0600 permissions; nothing secret is committed.
 

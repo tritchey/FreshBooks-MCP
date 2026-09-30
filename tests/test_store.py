@@ -102,3 +102,23 @@ def test_missing_credentials_name_what_is_missing(state_dir, monkeypatch):
 
     assert "FRESHBOOKS_CLIENT_SECRET" in str(excinfo.value)
     assert "FRESHBOOKS_CLIENT_ID" not in str(excinfo.value)
+
+
+def test_expense_ledger_is_separate_and_keyed_by_ref(state_dir):
+    store.set_ledger_entry(store.ledger_key(123, "2026-08-24"), 5001)
+    store.set_expense_ledger_entry("uber-1", 7001)
+    store.set_expense_ledger_entry("2026-09-01|Cafe|18.25", 7002)
+
+    assert store.load_expense_ledger() == {"uber-1": 7001, "2026-09-01|Cafe|18.25": 7002}
+    assert store.expense_ledger_ids() == {7001, 7002}
+    assert store.expense_ledger_refs() == {7001: "uber-1", 7002: "2026-09-01|Cafe|18.25"}
+    assert store.ledger_entry_ids() == {5001}  # time ledger untouched
+
+    assert store.drop_expense_ledger_id(9999) is False
+    assert store.drop_expense_ledger_id(7001) is True
+    store.drop_expense_ledger_key("2026-09-01|Cafe|18.25")
+    assert store.load_expense_ledger() == {}
+    assert sorted(p.name for p in state_dir.iterdir()) == [
+        store.EXPENSE_LEDGER_FILE,
+        store.LEDGER_FILE,
+    ]

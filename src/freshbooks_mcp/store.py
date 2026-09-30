@@ -1,4 +1,9 @@
-"""Local state: OAuth tokens, label->project mapping, and the write ledger.
+"""Local state: OAuth tokens, label->project mapping, and the write ledgers.
+
+Two ledgers record what this server created so re-syncs update instead of
+duplicating, and so nothing entered by hand in FreshBooks is ever touched:
+ledger.json maps "<project_id>:<date>" to a time entry id, expense_ledger.json
+maps a caller-chosen ref to an expense id.
 
 Every write goes through _write_json, which writes a temp file in the same
 directory and os.replace()s it into position. FreshBooks refresh tokens are
@@ -20,6 +25,7 @@ DEFAULT_STATE_DIR = Path.home() / ".freshbooks-mcp"
 TOKENS_FILE = "tokens.json"
 MAPPING_FILE = "mapping.json"
 LEDGER_FILE = "ledger.json"
+EXPENSE_LEDGER_FILE = "expense_ledger.json"
 CREDENTIALS_FILE = "credentials.json"
 
 DEFAULT_REDIRECT_URI = "https://localhost:8414/callback"
@@ -76,7 +82,7 @@ def _write_json(name: str, data: Any) -> None:
 
 
 def load_tokens() -> dict[str, Any]:
-    """{access_token, refresh_token, expires_at, business_id, account_id, identity_id}."""
+    """{access_token, refresh_token, expires_at, business_id, account_id, identity_id, staff_id}."""
     return _read_json(TOKENS_FILE) or {}
 
 
@@ -106,8 +112,35 @@ def set_mapping_entry(label: str, entry: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# ledger.json
+# ledgers: ledger.json (time entries) and expense_ledger.json (expenses)
 # --------------------------------------------------------------------------
+
+
+def _load_ledger(name: str) -> dict[str, int]:
+    return _read_json(name) or {}
+
+
+def _set_ledger_entry(name: str, key: str, remote_id: int) -> None:
+    ledger = _load_ledger(name)
+    ledger[key] = int(remote_id)
+    _write_json(name, ledger)
+
+
+def _drop_ledger_key(name: str, key: str) -> None:
+    ledger = _load_ledger(name)
+    if ledger.pop(key, None) is not None:
+        _write_json(name, ledger)
+
+
+def _drop_ledger_id(name: str, remote_id: int) -> bool:
+    """Remove whatever rows point at `remote_id`. True if any were removed."""
+    ledger = _load_ledger(name)
+    keys = [k for k, v in ledger.items() if int(v) == int(remote_id)]
+    for key in keys:
+        del ledger[key]
+    if keys:
+        _write_json(name, ledger)
+    return bool(keys)
 
 
 def ledger_key(project_id: int, date: str) -> str:
@@ -116,7 +149,7 @@ def ledger_key(project_id: int, date: str) -> str:
 
 def load_ledger() -> dict[str, int]:
     """{"<project_id>:<YYYY-MM-DD>": time_entry_id}."""
-    return _read_json(LEDGER_FILE) or {}
+    return _load_ledger(LEDGER_FILE)
 
 
 def save_ledger(ledger: dict[str, int]) -> None:
@@ -124,30 +157,51 @@ def save_ledger(ledger: dict[str, int]) -> None:
 
 
 def set_ledger_entry(key: str, time_entry_id: int) -> None:
-    ledger = load_ledger()
-    ledger[key] = int(time_entry_id)
-    save_ledger(ledger)
+    _set_ledger_entry(LEDGER_FILE, key, time_entry_id)
 
 
 def drop_ledger_key(key: str) -> None:
-    ledger = load_ledger()
-    if ledger.pop(key, None) is not None:
-        save_ledger(ledger)
+    _drop_ledger_key(LEDGER_FILE, key)
 
 
 def drop_ledger_entry_id(time_entry_id: int) -> bool:
     """Remove whatever ledger row points at `time_entry_id`. True if one was removed."""
-    ledger = load_ledger()
-    keys = [k for k, v in ledger.items() if int(v) == int(time_entry_id)]
-    for key in keys:
-        del ledger[key]
-    if keys:
-        save_ledger(ledger)
-    return bool(keys)
+    return _drop_ledger_id(LEDGER_FILE, time_entry_id)
 
 
 def ledger_entry_ids() -> set[int]:
     return {int(v) for v in load_ledger().values()}
+
+
+def load_expense_ledger() -> dict[str, int]:
+    """{"<ref>": expense_id}, where ref is the caller's idempotency key."""
+    return _load_ledger(EXPENSE_LEDGER_FILE)
+
+
+def save_expense_ledger(ledger: dict[str, int]) -> None:
+    _write_json(EXPENSE_LEDGER_FILE, ledger)
+
+
+def set_expense_ledger_entry(ref: str, expense_id: int) -> None:
+    _set_ledger_entry(EXPENSE_LEDGER_FILE, ref, expense_id)
+
+
+def drop_expense_ledger_key(ref: str) -> None:
+    _drop_ledger_key(EXPENSE_LEDGER_FILE, ref)
+
+
+def drop_expense_ledger_id(expense_id: int) -> bool:
+    """Remove whatever ledger row points at `expense_id`. True if one was removed."""
+    return _drop_ledger_id(EXPENSE_LEDGER_FILE, expense_id)
+
+
+def expense_ledger_ids() -> set[int]:
+    return {int(v) for v in load_expense_ledger().values()}
+
+
+def expense_ledger_refs() -> dict[int, str]:
+    """Inverse of the expense ledger: {expense_id: ref}."""
+    return {int(v): k for k, v in load_expense_ledger().items()}
 
 
 # --------------------------------------------------------------------------
