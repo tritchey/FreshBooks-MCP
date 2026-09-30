@@ -127,8 +127,9 @@ updates that expense instead of creating a second one.
 | `whoami` | Auth health check; identity + business |
 | `list_projects` / `list_clients` | Account data, for building the mapping |
 | `get_mapping` / `set_mapping` | hours-report label → FreshBooks project |
-| `list_time_entries` | What's logged in a range, flagged if created by this tool |
-| `log_time` | Idempotent upsert of per-day entries (create/update/unchanged per entry) |
+| `list_services` | A project's services (FreshBooks' tasks), to pick the one an entry is logged against |
+| `list_time_entries` | What's logged in a range, with its `service_id`, flagged if created by this tool |
+| `log_time` | Idempotent upsert of per-day entries (create/update/unchanged per entry); each entry may name its `service` or `service_id` |
 | `delete_time_entry` | Delete — refuses entries this tool didn't create |
 | `list_expense_categories` | Expense categories with their `Parent > Name` paths, for picking one by name, path or id |
 | `list_expenses` | Expenses in a date range, flagged if created by this tool |

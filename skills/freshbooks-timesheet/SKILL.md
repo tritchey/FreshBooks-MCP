@@ -40,6 +40,13 @@ propose the closest title match, and **confirm with the person before saving** w
 `set_mapping` — a wrong mapping bills the wrong client. Mappings persist in
 `~/.freshbooks-mcp/mapping.json`, so this is usually a first-run-only step.
 
+Then pick the **service** (FreshBooks calls it a task) for each project with
+`list_services(project_id)`. Every entry you push carries one: an entry logged without a
+service shows up untasked on the invoice. A project with a single service (typically
+`Development`) needs no question; when a project has several, ask which one applies —
+per project, or per day if the work genuinely differed. Pass it to `log_time` as
+`service` (the name, matched case-insensitively) or `service_id`.
+
 ## 3. Diff against what's already logged
 
 Call `list_time_entries` for the date range. Entries marked `owned_by_ledger` were
@@ -52,10 +59,12 @@ double-billing the day.
 
 Show a table before pushing anything:
 
-| Date | Project | Hours | Action | Note |
-|------|---------|-------|--------|------|
+| Date | Project | Service | Hours | Action | Note |
+|------|---------|---------|-------|--------|------|
 
 - **Hours** from `billable_min`; also state the raw midpoint total so the rounding is visible.
+- **Service** is the task from step 2, shown so the person can see what the invoice line
+  will be filed under.
 - **Action** is create / update / no change, from the step-3 diff.
 - **Note** becomes the FreshBooks entry note and can end up on an invoice. Write it from
   what actually happened that day — spot-read the transcripts as the hours-report skill
@@ -68,7 +77,7 @@ approval of the specific numbers.
 
 ## 5. Push and report
 
-Call `log_time` with the approved entries. Report the per-entry results (created /
+Call `log_time` with the approved entries, each carrying its `service`. Report the per-entry results (created /
 updated / unchanged / failed, with FreshBooks entry ids), the total hours logged, and
 any failures with their errors. If an entry failed, fix and retry just that entry rather
 than resubmitting the whole batch.

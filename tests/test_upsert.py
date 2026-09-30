@@ -19,6 +19,8 @@ IDENTITY_ID = 9001
 DAY = "2026-08-24"
 TIME_ENTRIES = f"/timetracking/business/{BUSINESS_ID}/time_entries"
 PROJECTS = f"/projects/business/{BUSINESS_ID}/projects"
+PROJECT_DETAIL = f"/projects/business/{BUSINESS_ID}/project/{PROJECT_ID}"
+SERVICE_ID = 777
 
 
 def expected_started_at(day: str) -> str:
@@ -81,6 +83,19 @@ class FakeFreshBooks:
                         }
                     ],
                     "meta": {"page": 1, "pages": 1, "total": 1},
+                },
+            )
+
+        if method == "GET" and path == PROJECT_DETAIL:
+            return httpx.Response(
+                200,
+                json={
+                    "project": {
+                        "id": PROJECT_ID,
+                        "title": "Acme Rebuild",
+                        "client_id": CLIENT_ID,
+                        "services": [{"id": SERVICE_ID, "name": "Development", "billable": True}],
+                    }
                 },
             )
 
@@ -304,3 +319,47 @@ def test_raw_project_id_resolves_client_id_from_projects(fake):
     payload = fake.calls("POST")[0][2]["time_entry"]
     assert payload["client_id"] == CLIENT_ID
     assert payload["billable"] is False
+
+
+def test_service_id_is_sent_and_a_changed_service_updates(fake):
+    created = log(service_id=SERVICE_ID)
+    entry_id = created["results"][0]["time_entry_id"]
+    assert fake.calls("POST")[0][2]["time_entry"]["service_id"] == SERVICE_ID
+    assert fake.entries[entry_id]["service_id"] == SERVICE_ID
+
+    # Same hours and note, same service: nothing to write.
+    fake.requests.clear()
+    assert log(service_id=SERVICE_ID)["results"][0]["action"] == "unchanged"
+    assert fake.calls("PUT") == []
+
+    # Same hours and note, a different service: that alone is a change.
+    fake.requests.clear()
+    result = log(service_id=SERVICE_ID + 1)
+    assert result["results"][0]["action"] == "updated"
+    assert fake.calls("PUT")[0][2]["time_entry"]["service_id"] == SERVICE_ID + 1
+
+    # No service asked for: the entry's service is left alone, not cleared.
+    fake.requests.clear()
+    assert log()["results"][0]["action"] == "unchanged"
+    assert fake.entries[entry_id]["service_id"] == SERVICE_ID + 1
+
+
+def test_service_name_resolves_against_the_projects_services(fake):
+    result = log(service="development")
+    assert result["results"][0]["action"] == "created"
+    assert fake.calls("POST")[0][2]["time_entry"]["service_id"] == SERVICE_ID
+    # One project lookup serves the whole batch.
+    assert len([c for c in fake.calls("GET") if c[1] == PROJECT_DETAIL]) == 1
+
+
+def test_unknown_service_name_fails_only_that_entry_and_lists_the_choices(fake):
+    result = log(service="Design")
+    assert result["summary"]["failed"] == 1
+    assert "Development" in result["results"][0]["error"]
+    assert fake.calls("POST") == []
+
+
+def test_list_services_reports_the_projects_services(fake):
+    result = server.list_services(PROJECT_ID)
+    assert result["project_title"] == "Acme Rebuild"
+    assert result["services"] == [{"service_id": SERVICE_ID, "name": "Development", "billable": True}]

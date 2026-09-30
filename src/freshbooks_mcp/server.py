@@ -422,6 +422,34 @@ def set_mapping(label: str, project_id: int) -> dict[str, Any]:
 
 @mcp.tool()
 @_handle_errors
+def list_services(project_id: int) -> dict[str, Any]:
+    """List the services (FreshBooks' tasks) a project's time can be logged
+    against, as service_id, name and billable. Pass one of them to log_time as
+    `service` (the name) or `service_id`; a project with a single service is the
+    usual case and needs no question.
+    """
+    tokens = _require_connection()
+    business_id = int(tokens["business_id"])
+    with _make_client() as client:
+        project = client.get_project(business_id, int(project_id))
+    if project is None:
+        raise RuntimeError(f"No project with id {project_id} in this business.")
+    return {
+        "project_id": int(project_id),
+        "project_title": project.get("title"),
+        "services": [
+            {
+                "service_id": service.get("id"),
+                "name": service.get("name"),
+                "billable": service.get("billable"),
+            }
+            for service in project.get("services") or []
+        ],
+    }
+
+
+@mcp.tool()
+@_handle_errors
 def list_time_entries(started_from: str, started_to: str) -> dict[str, Any]:
     """List time entries between two dates, inclusive. Dates are YYYY-MM-DD in
     local time. Each entry reports id, date (local), minutes, project_id,
@@ -448,6 +476,7 @@ def list_time_entries(started_from: str, started_to: str) -> dict[str, Any]:
                 "minutes": round((entry.get("duration") or 0) / 60, 2),
                 "project_id": entry.get("project_id"),
                 "client_id": entry.get("client_id"),
+                "service_id": entry.get("service_id"),
                 "note": entry.get("note"),
                 "billable": entry.get("billable"),
                 "billed": entry.get("billed"),
@@ -493,8 +522,11 @@ def _resolve_target(
 def log_time(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """Log time to FreshBooks idempotently. Each entry is a dict with:
     date ("YYYY-MM-DD"), minutes (number), note (string), either label (a mapped
-    label from get_mapping) or project_id (int), and optional billable (default
-    true).
+    label from get_mapping) or project_id (int), optional billable (default
+    true), and optionally the service (FreshBooks' "task") to log against: either
+    service_id (int) or service (its name, e.g. "Development", matched
+    case-insensitively against the project's services). An entry with no service
+    leaves the entry's service alone.
 
     One entry is kept per project per day. Re-running with the same date and
     project updates the entry this server previously created; if nothing changed
@@ -526,9 +558,19 @@ def log_time(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             return cache.get(project_id)
 
+        services_cache: dict[int, list[dict[str, Any]]] = {}
+
+        def lookup_services(project_id: int) -> list[dict[str, Any]]:
+            if project_id not in services_cache:
+                project = client.get_project(business_id, project_id) or {}
+                services_cache[project_id] = list(project.get("services") or [])
+            return services_cache[project_id]
+
         for raw in entries:
             try:
-                result = _log_one(client, business_id, identity_id, mapping, lookup_project, raw)
+                result = _log_one(
+                    client, business_id, identity_id, mapping, lookup_project, raw, lookup_services
+                )
             except Exception as exc:  # noqa: BLE001 - one bad entry must not sink the batch
                 result = {
                     "date": raw.get("date"),
@@ -543,6 +585,33 @@ def log_time(entries: list[dict[str, Any]]) -> dict[str, Any]:
     return {"results": results, "summary": summary}
 
 
+def _resolve_service(
+    raw: dict[str, Any],
+    project_id: int,
+    lookup_services: Callable[[int], list[dict[str, Any]]],
+) -> int | None:
+    """The service id an entry asked for, or None when it asked for none.
+
+    `service_id` wins when both are given. A `service` name is matched
+    case-insensitively against the project's own services, so a typo or a
+    service the project does not carry fails the entry with the real choices
+    listed rather than logging untasked time.
+    """
+    if raw.get("service_id") is not None:
+        return int(raw["service_id"])
+    name = str(raw.get("service") or "").strip()
+    if not name:
+        return None
+    services = lookup_services(project_id)
+    for service in services:
+        if str(service.get("name") or "").strip().lower() == name.lower():
+            return int(service["id"])
+    available = ", ".join(sorted(str(s.get("name")) for s in services)) or "none"
+    raise RuntimeError(
+        f"Project {project_id} has no service named {name!r}. Available: {available}."
+    )
+
+
 def _log_one(
     client: FreshBooksClient,
     business_id: int,
@@ -550,6 +619,7 @@ def _log_one(
     mapping: dict[str, Any],
     lookup_project: Callable[[int], dict[str, Any] | None],
     raw: dict[str, Any],
+    lookup_services: Callable[[int], list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     day = str(raw.get("date") or "")
     if not day:
@@ -566,6 +636,7 @@ def _log_one(
     note = str(raw.get("note") or "")
     billable = bool(raw.get("billable", True))
     project_id, client_id = _resolve_target(raw, mapping, lookup_project)
+    service_id = _resolve_service(raw, project_id, lookup_services or (lambda _pid: []))
     started_at = _started_at(day)
 
     key = store.ledger_key(project_id, day)
@@ -577,7 +648,11 @@ def _log_one(
             # Deleted in FreshBooks since we wrote it; forget it and start over.
             store.drop_ledger_key(key)
             existing_id = None
-        elif int(current.get("duration") or 0) == duration and (current.get("note") or "") == note:
+        elif (
+            int(current.get("duration") or 0) == duration
+            and (current.get("note") or "") == note
+            and (service_id is None or current.get("service_id") == service_id)
+        ):
             return {
                 "date": day,
                 "project_id": project_id,
@@ -597,6 +672,7 @@ def _log_one(
                     "billable": billable,
                     "client_id": client_id,
                     "project_id": project_id,
+                    **({"service_id": service_id} if service_id is not None else {}),
                 },
             )
             return {
@@ -618,6 +694,7 @@ def _log_one(
             "project_id": project_id,
             "identity_id": identity_id,
             "billable": billable,
+            **({"service_id": service_id} if service_id is not None else {}),
         },
     )
     new_id = created.get("id")

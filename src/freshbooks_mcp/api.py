@@ -164,6 +164,13 @@ class FreshBooksClient:
             projects = [p for p in projects if p.get("active", True) and not p.get("complete")]
         return projects
 
+    def get_project(self, business_id: int, project_id: int) -> dict[str, Any] | None:
+        """One project with its `services` (the tasks time can be logged against)."""
+        data = self._request(
+            "GET", f"/projects/business/{business_id}/project/{project_id}", missing_ok=True
+        )
+        return data.get("project") if data else None
+
     def list_clients(self, account_id: str) -> list[dict[str, Any]]:
         return self._paginate_accounting(
             f"/accounting/account/{account_id}/users/clients", "clients"
