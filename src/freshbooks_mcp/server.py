@@ -1,5 +1,5 @@
-"""FastMCP server exposing FreshBooks auth, lookups, and idempotent time and
-expense logging."""
+"""FastMCP server exposing FreshBooks auth, lookups, idempotent time and
+expense logging, and draft invoices."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any, Callable
 from mcp.server.mcpserver import MCPServer
 
 from . import __version__, auth, store
-from .api import FreshBooksClient
+from .api import FreshBooksClient, FreshBooksError
 
 # MCPServer is the mcp>=2 name for what used to be FastMCP; same high-level API.
 mcp = MCPServer("freshbooks", version=__version__)
@@ -25,6 +25,21 @@ WORKDAY_START_HOUR = 9
 DEFAULT_STAFF_ID = 1
 
 EXPENSE_STATUS = {0: "internal", 1: "outstanding", 2: "invoiced", 4: "recouped"}
+
+# Invoices are written in this currency unless the caller names another.
+DEFAULT_CURRENCY = "USD"
+
+# Line name for time-based lines whose service cannot be resolved.
+DEFAULT_SERVICE_NAME = "Development"
+
+INVOICE_LINE_STYLES = ("per_entry", "single")
+
+# Invoice fields that tie a line to Projects-service time; FreshBooks documents
+# them loosely, so a create that trips over them is retried without them.
+_LINKAGE_FIELDS = ("modern_project_id", "modern_time_entries")
+
+# Line type FreshBooks' own UI uses for a line grouping time entries.
+TIME_ENTRY_LINE_TYPE = 22
 
 
 # --------------------------------------------------------------------------
@@ -267,6 +282,10 @@ def submit_auth_code(code: str) -> dict[str, Any]:
 
     tokens = store.load_tokens()
     tokens["identity_id"] = identity.get("id")
+    # Kept for invoice line descriptions, which name the person who did the work.
+    for field in ("first_name", "last_name"):
+        if identity.get(field):
+            tokens[field] = identity[field]
     if businesses:
         tokens["business_id"] = businesses[0]["business_id"]
         tokens["account_id"] = businesses[0]["account_id"]
@@ -1044,6 +1063,613 @@ def delete_expense(expense_id: int) -> dict[str, Any]:
         client.delete_expense(account_id, int(expense_id))
     store.drop_expense_ledger_id(int(expense_id))
     return {"deleted": True, "expense_id": int(expense_id)}
+
+
+# --------------------------------------------------------------------------
+# invoice tools
+# --------------------------------------------------------------------------
+
+
+def _money(value: Any) -> str | None:
+    """A FreshBooks money value ({"amount": "1.5", "code": ...} or a bare number)
+    as a two-place decimal string, or None when absent. Zero and negative
+    amounts are reported as-is; this is for display, not validation."""
+    if isinstance(value, dict):
+        value = value.get("amount")
+    if value is None or value == "":
+        return None
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        return str(value)
+    if not amount.is_finite():
+        return str(value)
+    return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _invoice_id(invoice: dict[str, Any]) -> int | None:
+    value = invoice.get("id", invoice.get("invoiceid"))
+    return int(value) if value is not None else None
+
+
+def _line_time_entry_ids(line: dict[str, Any]) -> list[int]:
+    ids: list[int] = []
+    for item in line.get("modern_time_entries") or []:
+        if isinstance(item, dict):
+            item = item.get("id", item.get("time_entry_id"))
+        if item is not None:
+            ids.append(int(item))
+    return ids
+
+
+def _invoice_summary(
+    invoice: dict[str, Any], refs: dict[int, str], with_lines: bool = False
+) -> dict[str, Any]:
+    invoice_id = _invoice_id(invoice)
+    owned = invoice_id is not None and invoice_id in refs
+    amount = invoice.get("amount")
+    summary: dict[str, Any] = {
+        "invoice_id": invoice_id,
+        "invoice_number": invoice.get("invoice_number"),
+        "client_id": invoice.get("customerid"),
+        "client": _client_name(invoice) or None,
+        "create_date": invoice.get("create_date"),
+        "due_date": invoice.get("due_date"),
+        "status": invoice.get("v3_status"),
+        "amount": _money(amount),
+        "outstanding": _money(invoice.get("outstanding")),
+        "currency_code": invoice.get("currency_code")
+        or (amount.get("code") if isinstance(amount, dict) else None),
+        "owned_by_ledger": owned,
+    }
+    if owned:
+        summary["ref"] = refs[invoice_id]  # type: ignore[index]
+    if with_lines:
+        summary["notes"] = invoice.get("notes")
+        summary["po_number"] = invoice.get("po_number")
+        summary["lines"] = [
+            {
+                "lineid": line.get("lineid"),
+                "name": line.get("name"),
+                "description": line.get("description"),
+                "qty": line.get("qty"),
+                "unit_cost": _money(line.get("unit_cost")),
+                "amount": _money(line.get("amount")),
+                "modern_project_id": line.get("modern_project_id"),
+                "time_entry_ids": _line_time_entry_ids(line),
+            }
+            for line in invoice.get("lines") or []
+        ]
+    return summary
+
+
+def _unit_cost(value: Any) -> str:
+    try:
+        amount = Decimal(str(value))
+    except InvalidOperation:
+        raise RuntimeError(f"Line unit_cost {value!r} is not a number.") from None
+    if not amount.is_finite():
+        raise RuntimeError(f"Line unit_cost {value!r} is not a number.")
+    return str(amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _quantity(value: Any) -> int | float:
+    try:
+        qty = float(value)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"Line qty {value!r} is not a number.") from None
+    if qty != qty or qty in (float("inf"), float("-inf")) or qty <= 0:
+        raise RuntimeError(f"Line qty must be a positive number, got {value!r}.")
+    return int(qty) if qty.is_integer() else qty
+
+
+def _invoice_line(raw: dict[str, Any], currency: str) -> dict[str, Any]:
+    """Build one writable invoice line from a caller's line dict. Optional
+    fields are omitted rather than sent as null."""
+    name = str(raw.get("name") or "").strip()
+    if not name:
+        raise RuntimeError("Every invoice line needs a 'name'.")
+    if raw.get("qty") is None:
+        raise RuntimeError(f"Invoice line {name!r} is missing 'qty'.")
+    if raw.get("unit_cost") is None:
+        raise RuntimeError(f"Invoice line {name!r} is missing 'unit_cost'.")
+    line: dict[str, Any] = {
+        "name": name,
+        "description": str(raw.get("description") or ""),
+        "qty": _quantity(raw["qty"]),
+        "unit_cost": {"amount": _unit_cost(raw["unit_cost"]), "code": currency},
+    }
+    if raw.get("project_id") is not None:
+        line["modern_project_id"] = int(raw["project_id"])
+    if raw.get("time_entry_ids"):
+        line["modern_time_entries"] = [int(i) for i in raw["time_entry_ids"]]
+    if raw.get("type") is not None:
+        line["type"] = int(raw["type"])
+    return line
+
+
+def _invoice_payload(
+    client_id: int,
+    create_date: str,
+    lines: list[dict[str, Any]],
+    currency: str,
+    due_offset_days: int | None,
+    notes: str | None,
+    po_number: str | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "customerid": int(client_id),
+        "create_date": create_date,
+        "currency_code": currency,
+        "lines": lines,
+    }
+    if due_offset_days is not None:
+        payload["due_offset_days"] = int(due_offset_days)
+    if notes:
+        payload["notes"] = notes
+    if po_number:
+        payload["po_number"] = po_number
+    return payload
+
+
+def _existing_invoice(
+    client: FreshBooksClient, account_id: str, ref: str
+) -> dict[str, Any] | None:
+    """The live invoice the ledger holds under `ref`, or None. A ledger row whose
+    invoice has since been deleted in FreshBooks is forgotten."""
+    existing_id = store.load_invoice_ledger().get(ref)
+    if existing_id is None:
+        return None
+    current = client.get_invoice(account_id, int(existing_id))
+    if current is None or current.get("vis_state") == 1:
+        store.drop_invoice_ledger_key(ref)
+        return None
+    return current
+
+
+def _finish_invoice(
+    client: FreshBooksClient,
+    account_id: str,
+    created: dict[str, Any],
+    ref: str | None,
+    mark_as_sent: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Record a just-created invoice in the ledger, optionally mark it sent, and
+    re-read it with lines. Returns (summary-with-lines, step report)."""
+    invoice_id = _invoice_id(created)
+    if invoice_id is None:
+        raise RuntimeError(f"FreshBooks did not return an id for the created invoice: {created}")
+    store.set_invoice_ledger_entry(ref or str(invoice_id), invoice_id)
+
+    steps: dict[str, Any] = {"marked_sent": False}
+    if mark_as_sent:
+        try:
+            client.mark_invoice_sent(account_id, invoice_id)
+            steps["marked_sent"] = True
+        except Exception as exc:  # noqa: BLE001 - the draft exists; say so and report why
+            steps["mark_sent_error"] = str(exc) or exc.__class__.__name__
+
+    current = client.get_invoice(account_id, invoice_id) or created
+    return _invoice_summary(current, store.invoice_ledger_refs(), with_lines=True), steps
+
+
+@mcp.tool()
+@_handle_errors
+def list_invoices(
+    date_from: str | None = None,
+    date_to: str | None = None,
+    client_id: int | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """List invoices, optionally filtered by create date range (YYYY-MM-DD,
+    inclusive), client_id, and status (FreshBooks' v3_status: draft, sent,
+    viewed, paid, partial, overdue, ...). Each invoice reports invoice_id,
+    invoice_number, client_id, client, create_date, due_date, status, amount,
+    outstanding, currency_code and owned_by_ledger - true when this server
+    created the invoice (its ref is included too) and may therefore delete it.
+    Deleted invoices are omitted. Use get_invoice for the lines.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    for day in (date_from, date_to):
+        if day:
+            date.fromisoformat(day)
+
+    with _make_client() as client:
+        invoices = client.list_invoices(
+            account_id,
+            customer_id=client_id,
+            date_from=date_from,
+            date_to=date_to,
+            v3_status=status,
+        )
+
+    refs = store.invoice_ledger_refs()
+    return {
+        "invoices": [
+            _invoice_summary(invoice, refs) for invoice in invoices if invoice.get("vis_state") != 1
+        ]
+    }
+
+
+@mcp.tool()
+@_handle_errors
+def get_invoice(invoice_id: int) -> dict[str, Any]:
+    """Return one invoice: the list_invoices summary plus notes, po_number and
+    its lines (lineid, name, description, qty, unit_cost, amount,
+    modern_project_id, and time_entry_ids - the time entries FreshBooks has tied
+    to the line, empty when none).
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    with _make_client() as client:
+        invoice = client.get_invoice(account_id, int(invoice_id))
+    if invoice is None or invoice.get("vis_state") == 1:
+        raise RuntimeError(f"No invoice with id {invoice_id} in this account.")
+    return _invoice_summary(invoice, store.invoice_ledger_refs(), with_lines=True)
+
+
+@mcp.tool()
+@_handle_errors
+def create_invoice(
+    lines: list[dict[str, Any]],
+    client_id: int | None = None,
+    label: str | None = None,
+    create_date: str | None = None,
+    due_offset_days: int | None = None,
+    notes: str | None = None,
+    po_number: str | None = None,
+    ref: str | None = None,
+    mark_as_sent: bool = False,
+    currency_code: str | None = None,
+) -> dict[str, Any]:
+    """Create a FreshBooks invoice as a Draft. Nothing is sent to the client:
+    the invoice stays a draft unless mark_as_sent=True, and even then its status
+    only changes to sent - this server never emails an invoice.
+
+    The client is client_id, or the client of a mapped label's project (from
+    get_mapping); client_id wins when both are given. Each line is a dict with
+    name, qty (number), unit_cost (number or string; in currency_code, default
+    USD), optional description, and optionally project_id and time_entry_ids
+    (ints) to tie the line to Projects-service time, plus an optional line
+    type (int; FreshBooks' own UI uses 22 for a line grouping time entries). That linkage is
+    best-effort: FreshBooks documents it loosely, so check get_invoice and the
+    entries' billed flag afterwards. create_date defaults to today; FreshBooks
+    numbers the invoice itself.
+
+    ref (optional) is an idempotency key of your choosing: if an invoice this
+    server created under the same ref still exists, it is returned with action
+    "exists" and nothing is written. Returns action, marked_sent and the invoice
+    with its lines.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    if not lines:
+        raise RuntimeError("An invoice needs at least one line.")
+    day = create_date or date.today().isoformat()
+    date.fromisoformat(day)
+    currency = str(currency_code or DEFAULT_CURRENCY).strip().upper()
+    built = [_invoice_line(raw, currency) for raw in lines]
+    ref = str(ref or "").strip() or None
+
+    with _make_client() as client:
+        if client_id is None:
+            if not label:
+                raise RuntimeError("create_invoice needs either a client_id or a mapped label.")
+            _project_id, client_id = _resolve_target(
+                {"label": label}, store.load_mapping(), lambda _pid: None
+            )
+            if client_id is None:
+                raise RuntimeError(f"Label {label!r} has no client_id in the mapping; pass client_id.")
+
+        if ref:
+            existing = _existing_invoice(client, account_id, ref)
+            if existing is not None:
+                return {
+                    "action": "exists",
+                    "invoice": _invoice_summary(
+                        existing, store.invoice_ledger_refs(), with_lines=True
+                    ),
+                }
+
+        payload = _invoice_payload(
+            int(client_id), day, built, currency, due_offset_days, notes, po_number
+        )
+        created = client.create_invoice(account_id, payload)
+        summary, steps = _finish_invoice(client, account_id, created, ref, mark_as_sent)
+    return {"action": "created", **steps, "invoice": summary}
+
+
+def _hours_text(hours: float) -> str:
+    """Hours as FreshBooks' UI writes a time-group qty: "88" when whole, else "4.50"."""
+    value = Decimal(str(hours)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return str(int(value)) if value == value.to_integral_value() else str(value)
+
+
+def _display_date(day: str) -> str:
+    """"Oct 1, 2026" - month abbreviation, day without a leading zero."""
+    parsed = date.fromisoformat(day)
+    return f"{parsed:%b} {parsed.day}, {parsed.year}"
+
+
+def _time_group_description(project_title: str, staff_name: str, first: str, last: str) -> str:
+    """The description FreshBooks' UI writes on a line built from unbilled time,
+    e.g. "(Acme) Tim Ritchey \u2013 Oct 1, 2026 - Oct 15, 2026" (en dash after the name)."""
+    return f"({project_title}) {staff_name} \u2013 {_display_date(first)} - {_display_date(last)}"
+
+
+def _staff_name(client: FreshBooksClient, tokens: dict[str, Any]) -> str:
+    """The connected identity's "First Last", from tokens.json when recorded,
+    else from a live identity lookup."""
+    first, last = tokens.get("first_name"), tokens.get("last_name")
+    if not (first or last):
+        identity = client.get_identity()
+        first, last = identity.get("first_name"), identity.get("last_name")
+    return " ".join(part for part in (first, last) if part).strip()
+
+
+def _local_window_entries(
+    client: FreshBooksClient, business_id: int, started_from: str, started_to: str
+) -> list[dict[str, Any]]:
+    """Time entries whose local start date falls in [started_from, started_to],
+    using the same UTC window list_time_entries asks FreshBooks for."""
+    window_start = _utc_iso(_local_midnight(started_from))
+    window_end = _utc_iso(_local_midnight(started_to) + timedelta(days=1))
+    entries = client.list_time_entries(
+        business_id, started_from=window_start, started_to=window_end
+    )
+    return [
+        entry
+        for entry in entries
+        if started_from <= _local_day_of(entry.get("started_at") or "") <= started_to
+    ]
+
+
+@mcp.tool()
+@_handle_errors
+def create_invoice_from_time(
+    started_from: str,
+    started_to: str,
+    label: str | None = None,
+    project_id: int | None = None,
+    line_style: str = "per_entry",
+    create_date: str | None = None,
+    due_offset_days: int | None = None,
+    notes: str | None = None,
+    po_number: str | None = None,
+    mark_as_sent: bool = False,
+    include_billed: bool = False,
+) -> dict[str, Any]:
+    """Create a Draft invoice for an hourly project's billable time between two
+    dates, inclusive (YYYY-MM-DD, local). The project is a mapped label or a
+    project_id; its client and hourly rate are used. Entries that are not
+    billable are skipped, as are entries already billed unless
+    include_billed=True. Nothing is sent to the client: the invoice stays a
+    draft unless mark_as_sent=True, and even then only its status changes -
+    this server never emails an invoice.
+
+    line_style "per_entry" (default) makes one line per entry ("YYYY-MM-DD:
+    note", hours at the project rate); "single" groups the time the way
+    FreshBooks' own UI does - one line per service, described as
+    "(Project) First Last \u2013 Oct 1, 2026 - Oct 15, 2026" over the first and last
+    dates actually billed. Each line asks FreshBooks to tie it to its time entries
+    (modern_time_entries), which should mark them billed. That linkage is
+    best-effort: if FreshBooks rejects it the invoice is created without it and
+    linked=false is returned; billed_after counts the entries FreshBooks now
+    reports as billed.
+
+    One invoice per project and range: a repeat call returns action "exists"
+    and writes nothing. With no billable entries it returns
+    action "nothing_to_bill" with the counts.
+    """
+    tokens = _require_connection()
+    business_id = int(tokens["business_id"])
+    account_id = _require_account(tokens)
+    date.fromisoformat(started_from)
+    date.fromisoformat(started_to)
+    if started_from > started_to:
+        raise RuntimeError(f"started_from {started_from} is after started_to {started_to}.")
+    if line_style not in INVOICE_LINE_STYLES:
+        raise RuntimeError(
+            f"Unknown line_style {line_style!r}. Use one of: {', '.join(INVOICE_LINE_STYLES)}."
+        )
+    day = create_date or date.today().isoformat()
+    date.fromisoformat(day)
+
+    if label:
+        project_id, _client = _resolve_target({"label": label}, store.load_mapping(), lambda _pid: None)
+    if project_id is None:
+        raise RuntimeError("create_invoice_from_time needs either a mapped label or a project_id.")
+    project_id = int(project_id)
+
+    with _make_client() as client:
+        project = client.get_project(business_id, project_id)
+        if project is None:
+            raise RuntimeError(
+                f"No project with id {project_id} in this business. "
+                "Call list_projects(active_only=False) to see the available ids."
+            )
+        if project.get("project_type") != "hourly_rate" or not project.get("rate"):
+            raise RuntimeError(
+                f"Project {project_id} is not billed hourly (project_type "
+                f"{project.get('project_type')!r}, rate {project.get('rate')!r}); "
+                "build its invoice with create_invoice instead."
+            )
+        client_id = project.get("client_id")
+        if client_id is None:
+            raise RuntimeError(f"Project {project_id} has no client to invoice.")
+        rate = _unit_cost(project["rate"])
+        services = {
+            int(s["id"]): str(s.get("name") or DEFAULT_SERVICE_NAME)
+            for s in project.get("services") or []
+            if s.get("id") is not None
+        }
+
+        ref = f"time|{project_id}|{started_from}|{started_to}"
+        existing = _existing_invoice(client, account_id, ref)
+        if existing is not None:
+            return {
+                "action": "exists",
+                "invoice": _invoice_summary(existing, store.invoice_ledger_refs(), with_lines=True),
+            }
+
+        in_project = [
+            e
+            for e in _local_window_entries(client, business_id, started_from, started_to)
+            if e.get("project_id") is not None and int(e["project_id"]) == project_id
+        ]
+        counts = {"found": len(in_project), "inactive": 0, "non_billable": 0, "already_billed": 0}
+        billable: list[dict[str, Any]] = []
+        for entry in in_project:
+            if entry.get("active") is False:
+                counts["inactive"] += 1
+            elif not entry.get("billable"):
+                counts["non_billable"] += 1
+            elif entry.get("billed") and not include_billed:
+                counts["already_billed"] += 1
+            else:
+                billable.append(entry)
+
+        if not billable:
+            return {
+                "action": "nothing_to_bill",
+                "project_id": project_id,
+                "started_from": started_from,
+                "started_to": started_to,
+                "counts": counts,
+            }
+
+        billable.sort(key=lambda e: (str(e.get("started_at") or ""), int(e.get("id") or 0)))
+
+        def service_name(entry: dict[str, Any]) -> str:
+            service_id = entry.get("service_id")
+            if service_id is not None and int(service_id) in services:
+                return services[int(service_id)]
+            return DEFAULT_SERVICE_NAME
+
+        ids = [int(e["id"]) for e in billable]
+        total_hours = round(sum(int(e.get("duration") or 0) for e in billable) / 3600, 2)
+        unit_cost = {"amount": rate, "code": DEFAULT_CURRENCY}
+        if line_style == "per_entry":
+            lines = [
+                {
+                    "type": TIME_ENTRY_LINE_TYPE,
+                    "name": service_name(entry),
+                    "description": (
+                        f"{_local_day_of(entry.get('started_at') or '')}: {entry.get('note') or ''}"
+                    ).rstrip(),
+                    "qty": round(int(entry.get("duration") or 0) / 3600, 2),
+                    "unit_cost": dict(unit_cost),
+                    "modern_project_id": project_id,
+                    "modern_time_entries": [int(entry["id"])],
+                }
+                for entry in billable
+            ]
+        else:
+            staff = _staff_name(client, tokens)
+            title = str(project.get("title") or "")
+            groups: dict[str, list[dict[str, Any]]] = {}
+            for entry in billable:  # already in date order, so groups keep first-seen order
+                groups.setdefault(service_name(entry), []).append(entry)
+            lines = []
+            for name, group in groups.items():
+                days = [_local_day_of(e.get("started_at") or "") for e in group]
+                lines.append(
+                    {
+                        "type": TIME_ENTRY_LINE_TYPE,
+                        "name": name,
+                        "description": _time_group_description(title, staff, days[0], days[-1]),
+                        "qty": _hours_text(
+                            sum(int(e.get("duration") or 0) for e in group) / 3600
+                        ),
+                        "unit_cost": dict(unit_cost),
+                        "modern_project_id": project_id,
+                        "modern_time_entries": [int(e["id"]) for e in group],
+                    }
+                )
+
+        payload = _invoice_payload(
+            int(client_id), day, lines, DEFAULT_CURRENCY, due_offset_days, notes, po_number
+        )
+        linked = True
+        try:
+            created = client.create_invoice(account_id, payload)
+        except FreshBooksError as exc:
+            if not any(field in str(exc) for field in _LINKAGE_FIELDS):
+                raise
+            linked = False
+            # The time-group line type only makes sense with linked entries.
+            payload["lines"] = [
+                {k: v for k, v in line.items() if k not in (*_LINKAGE_FIELDS, "type")}
+                for line in lines
+            ]
+            created = client.create_invoice(account_id, payload)
+
+        summary, steps = _finish_invoice(client, account_id, created, ref, mark_as_sent)
+
+        billed_after = 0
+        for entry_id in ids:
+            current = client.get_time_entry(business_id, entry_id)
+            if current and current.get("billed"):
+                billed_after += 1
+
+    return {
+        "action": "created",
+        "invoice": summary,
+        "time_entries": {"count": len(ids), "total_hours": total_hours, "ids": ids},
+        "linked": linked,
+        "billed_after": billed_after,
+        **steps,
+    }
+
+
+@mcp.tool()
+@_handle_errors
+def mark_invoice_sent(invoice_id: int) -> dict[str, Any]:
+    """Mark a draft invoice as sent. This changes the invoice's status only; it
+    never emails the client or anyone else. Works on any draft invoice,
+    including ones made by hand, and refuses an invoice that is not a draft.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    with _make_client() as client:
+        invoice = client.get_invoice(account_id, int(invoice_id))
+        if invoice is None or invoice.get("vis_state") == 1:
+            raise RuntimeError(f"No invoice with id {invoice_id} in this account.")
+        previous = invoice.get("v3_status")
+        if previous != "draft":
+            raise RuntimeError(
+                f"Refusing to mark invoice {invoice_id} as sent: its status is "
+                f"{previous!r}, not 'draft'."
+            )
+        updated = client.mark_invoice_sent(account_id, int(invoice_id))
+    return {
+        "invoice_id": int(invoice_id),
+        "status": updated.get("v3_status"),
+        "previous_status": previous,
+    }
+
+
+@mcp.tool()
+@_handle_errors
+def delete_invoice(invoice_id: int) -> dict[str, Any]:
+    """Delete an invoice that this server created. Refuses any id that is not in
+    the local invoice ledger, so invoices made in FreshBooks by hand can never
+    be deleted through this tool. Use list_invoices to see which invoices are
+    owned_by_ledger.
+    """
+    tokens = _require_connection()
+    account_id = _require_account(tokens)
+    if int(invoice_id) not in store.invoice_ledger_ids():
+        raise RuntimeError(
+            f"Refusing to delete invoice {invoice_id}: it was not created by this "
+            "server (not in the local ledger). Delete it in FreshBooks if that is intended."
+        )
+
+    with _make_client() as client:
+        client.delete_invoice(account_id, int(invoice_id))
+    store.drop_invoice_ledger_id(int(invoice_id))
+    return {"deleted": True, "invoice_id": int(invoice_id)}
 
 
 def main() -> None:

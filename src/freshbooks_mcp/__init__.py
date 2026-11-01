@@ -1,4 +1,4 @@
 """FreshBooks MCP server: OAuth2 auth, project/client lookup, and idempotent time and
-expense logging."""
+expense logging, and draft invoices."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

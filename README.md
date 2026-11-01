@@ -1,7 +1,7 @@
 # FreshBooks MCP
 
-An MCP server that connects Claude Code to a FreshBooks account for time entries and
-expenses, plus two companion skills: `hours-report`, which estimates attended hours from Claude Code session
+An MCP server that connects Claude Code to a FreshBooks account for time entries,
+expenses and draft invoices, plus two companion skills: `hours-report`, which estimates attended hours from Claude Code session
 transcripts, and `freshbooks-timesheet`, which turns those hours into FreshBooks time
 entries — with a human review step before anything is pushed.
 
@@ -9,7 +9,7 @@ entries — with a human review step before anything is pushed.
 
 - **`src/freshbooks_mcp/`** — Python MCP server (FastMCP, stdio). OAuth2 against the
   FreshBooks API; tools for projects, clients, expense categories, and idempotent
-  time-entry and expense upserts.
+  time-entry and expense upserts, and draft invoices built from logged time.
 - **`skills/hours-report/`** — Claude Code skill (with `scripts/session_hours.py`) that
   reconstructs attended time per day and per project from `~/.claude/projects/*/*.jsonl`,
   separating it from session wall-clock and rounding to billable increments. Usable on
@@ -19,7 +19,7 @@ entries — with a human review step before anything is pushed.
 - **`skills/freshbooks-timesheet/`** — Claude Code skill that orchestrates:
   hours-report → label→project mapping → proposed-entries table → approval → `log_time`.
 - **`~/.freshbooks-mcp/`** — local state: OAuth tokens, label→project mapping, and
-  ledgers of the time-entry and expense ids this tool created (so re-syncs update
+  ledgers of the time-entry, expense and invoice ids this tool created (so re-syncs update
   instead of duplicate, and hand-entered records are never touched).
 
 ## Setup
@@ -29,7 +29,10 @@ entries — with a human review step before anything is pushed.
 1. Go to <https://my.freshbooks.com/#/developer> and create an application.
 2. Scopes: `user:profile:read`, `user:clients:read`, `user:projects:read`,
    `user:time_entries:read`, `user:time_entries:write`, `user:expenses:read`,
-   `user:expenses:write`.
+   `user:expenses:write`, `user:invoices:read`, `user:invoices:write`.
+   Existing installs: the invoice scopes are new in 0.3.0. Add them to the app in the
+   developer portal, then reconnect (`get_auth_url` → `submit_auth_code`, step 4) so the
+   token carries them.
 3. Redirect URI: `https://localhost:8414/callback` (it never needs to serve anything —
    FreshBooks requires an HTTPS URI, and the auth flow copies the code from the address bar).
 4. Note the **Client ID** and **Client Secret**.
@@ -135,11 +138,34 @@ updates that expense instead of creating a second one.
 | `list_expenses` | Expenses in a date range, flagged if created by this tool |
 | `log_expenses` | Idempotent upsert of expenses keyed by `ref` (create/update/unchanged per entry) |
 | `delete_expense` | Soft-delete — refuses expenses this tool didn't create |
+| `list_invoices` / `get_invoice` | Invoices (filter by create date, client, status), flagged if created by this tool; `get_invoice` adds lines and their linked time-entry ids |
+| `create_invoice` | Draft invoice from explicit lines; optional `ref` makes a repeat a no-op |
+| `create_invoice_from_time` | Draft invoice from a project's unbilled billable time in a date range |
+| `mark_invoice_sent` | Draft → sent; status only, never emails anyone |
+| `delete_invoice` | Soft-delete — refuses invoices this tool didn't create |
+
+## Invoices
+
+- `create_invoice(lines, client_id | label, ...)` and `create_invoice_from_time(started_from,
+  started_to, label | project_id, line_style="per_entry" | "single", ...)` always create a
+  **Draft**. Pass `mark_as_sent=True`, or call `mark_invoice_sent` later, to flip the status
+  to sent. No tool in this server emails an invoice; send it from FreshBooks yourself.
+- `create_invoice_from_time` uses the project's hourly rate (fixed-price projects are
+  refused) and skips non-billable and already-billed entries. `per_entry` makes one line
+  per entry; `single` groups by service the way FreshBooks' UI does
+  ("(Project) First Last – Oct 1, 2026 - Oct 15, 2026").
+- Lines are tied to their time entries through `modern_time_entries`, which should flip
+  the entries' `billed` flag. This is best-effort: if FreshBooks rejects the linkage the
+  invoice is created without it (`linked: false`), and `billed_after` reports how many
+  entries FreshBooks now shows as billed.
+- `~/.freshbooks-mcp/invoice_ledger.json` maps a ref to each invoice this tool created
+  (`time|<project_id>|<from>|<to>` for time-based ones), so a repeat call returns
+  `exists` instead of a duplicate, and `delete_invoice` only touches those.
 
 ## Safety properties
 
-- Time entries and expenses not created by this tool (not in a ledger) are never updated
-  or deleted.
+- Time entries, expenses and invoices not created by this tool (not in a ledger) are never updated
+  or deleted. Invoices are created as drafts and never emailed.
 - Re-running a sync for an overlapping range updates in place; no duplicates.
 - Token/state files live outside the repo with 0600 permissions; nothing secret is committed.
 

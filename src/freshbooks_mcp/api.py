@@ -287,6 +287,75 @@ class FreshBooksClient:
         by setting vis_state to 1."""
         self.update_expense(account_id, expense_id, {"vis_state": 1})
 
+    # ------------------------------------------------------------------
+    # invoices
+    # ------------------------------------------------------------------
+
+    def list_invoices(
+        self,
+        account_id: str,
+        customer_id: int | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        v3_status: str | None = None,
+        include_lines: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Invoices, optionally filtered by client, create_date range (YYYY-MM-DD,
+        inclusive) and v3_status."""
+        params: dict[str, Any] = {}
+        if customer_id is not None:
+            params["search[customerid]"] = int(customer_id)
+        if date_from:
+            params["search[date_min]"] = date_from
+        if date_to:
+            params["search[date_max]"] = date_to
+        if v3_status:
+            params["search[v3_status]"] = v3_status
+        if include_lines:
+            params["include[]"] = "lines"
+        return self._paginate_accounting(
+            f"/accounting/account/{account_id}/invoices/invoices", "invoices", params
+        )
+
+    def get_invoice(self, account_id: str, invoice_id: int) -> dict[str, Any] | None:
+        """Return one invoice with its lines, or None if FreshBooks has no such id.
+        A soft-deleted invoice is still returned, with vis_state == 1."""
+        data = self._request(
+            "GET",
+            f"/accounting/account/{account_id}/invoices/invoices/{invoice_id}",
+            params={"include[]": "lines"},
+            missing_ok=True,
+        )
+        if data is None:
+            return None
+        return _accounting_result(data).get("invoice") or None
+
+    def create_invoice(self, account_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        data = self._request(
+            "POST",
+            f"/accounting/account/{account_id}/invoices/invoices",
+            json_body={"invoice": payload},
+        )
+        return _accounting_result(data).get("invoice") or {}
+
+    def update_invoice(
+        self, account_id: str, invoice_id: int, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        data = self._request(
+            "PUT",
+            f"/accounting/account/{account_id}/invoices/invoices/{invoice_id}",
+            json_body={"invoice": payload},
+        )
+        return _accounting_result(data).get("invoice") or {}
+
+    def mark_invoice_sent(self, account_id: str, invoice_id: int) -> dict[str, Any]:
+        """Flip a draft to sent. This changes status only; it does not email anyone."""
+        return self.update_invoice(account_id, invoice_id, {"action_mark_as_sent": True})
+
+    def delete_invoice(self, account_id: str, invoice_id: int) -> None:
+        """Soft delete via vis_state, like expenses."""
+        self.update_invoice(account_id, invoice_id, {"vis_state": 1})
+
 
 def _accounting_result(data: Any) -> dict[str, Any]:
     """Unwrap the Accounting service's {"response": {"result": {...}}} envelope."""

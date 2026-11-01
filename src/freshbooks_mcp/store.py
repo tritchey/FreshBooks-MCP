@@ -1,9 +1,10 @@
 """Local state: OAuth tokens, label->project mapping, and the write ledgers.
 
-Two ledgers record what this server created so re-syncs update instead of
+Three ledgers record what this server created so re-syncs update instead of
 duplicating, and so nothing entered by hand in FreshBooks is ever touched:
 ledger.json maps "<project_id>:<date>" to a time entry id, expense_ledger.json
-maps a caller-chosen ref to an expense id.
+maps a caller-chosen ref to an expense id, and invoice_ledger.json maps a ref
+to an invoice id.
 
 Every write goes through _write_json, which writes a temp file in the same
 directory and os.replace()s it into position. FreshBooks refresh tokens are
@@ -26,6 +27,7 @@ TOKENS_FILE = "tokens.json"
 MAPPING_FILE = "mapping.json"
 LEDGER_FILE = "ledger.json"
 EXPENSE_LEDGER_FILE = "expense_ledger.json"
+INVOICE_LEDGER_FILE = "invoice_ledger.json"
 CREDENTIALS_FILE = "credentials.json"
 
 DEFAULT_REDIRECT_URI = "https://localhost:8414/callback"
@@ -112,7 +114,8 @@ def set_mapping_entry(label: str, entry: dict[str, Any]) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
-# ledgers: ledger.json (time entries) and expense_ledger.json (expenses)
+# ledgers: ledger.json (time entries), expense_ledger.json (expenses),
+# invoice_ledger.json (invoices)
 # --------------------------------------------------------------------------
 
 
@@ -202,6 +205,37 @@ def expense_ledger_ids() -> set[int]:
 def expense_ledger_refs() -> dict[int, str]:
     """Inverse of the expense ledger: {expense_id: ref}."""
     return {int(v): k for k, v in load_expense_ledger().items()}
+
+
+def load_invoice_ledger() -> dict[str, int]:
+    """{"<ref>": invoice_id}, where ref is the caller's (or a derived) idempotency key."""
+    return _load_ledger(INVOICE_LEDGER_FILE)
+
+
+def save_invoice_ledger(ledger: dict[str, int]) -> None:
+    _write_json(INVOICE_LEDGER_FILE, ledger)
+
+
+def set_invoice_ledger_entry(ref: str, invoice_id: int) -> None:
+    _set_ledger_entry(INVOICE_LEDGER_FILE, ref, invoice_id)
+
+
+def drop_invoice_ledger_key(ref: str) -> None:
+    _drop_ledger_key(INVOICE_LEDGER_FILE, ref)
+
+
+def drop_invoice_ledger_id(invoice_id: int) -> bool:
+    """Remove whatever ledger row points at `invoice_id`. True if one was removed."""
+    return _drop_ledger_id(INVOICE_LEDGER_FILE, invoice_id)
+
+
+def invoice_ledger_ids() -> set[int]:
+    return {int(v) for v in load_invoice_ledger().values()}
+
+
+def invoice_ledger_refs() -> dict[int, str]:
+    """Inverse of the invoice ledger: {invoice_id: ref}."""
+    return {int(v): k for k, v in load_invoice_ledger().items()}
 
 
 # --------------------------------------------------------------------------

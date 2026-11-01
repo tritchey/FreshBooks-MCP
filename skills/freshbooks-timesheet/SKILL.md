@@ -82,6 +82,17 @@ updated / unchanged / failed, with FreshBooks entry ids), the total hours logged
 any failures with their errors. If an entry failed, fix and retry just that entry rather
 than resubmitting the whole batch.
 
+## 6. Invoicing (only when asked)
+
+Only when the person asks for an invoice, and only after the entries are approved and
+pushed in step 5: call `create_invoice_from_time` with the project's label and the same
+date range (`line_style` "per_entry" unless they ask for one grouped line per service,
+"single"). Show the draft back: invoice number, client, total, the lines, and whether
+`linked` is true and `billed_after` matches the entry count (if not, say the time entries
+may still show as unbilled). The invoice stays a Draft. Call `mark_invoice_sent` only on
+an explicit ask, and say plainly that it changes the status only; nothing is emailed, so
+the person sends it from FreshBooks.
+
 ## Cautions
 
 - The hours are a **floor** — Claude Code sessions only. Repeat the hours-report skill's
